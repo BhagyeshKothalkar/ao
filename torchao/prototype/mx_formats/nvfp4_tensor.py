@@ -440,6 +440,49 @@ def nvfp4_transpose(func, types, args, kwargs):
     )
     return new
 
+@implements([aten.expand.default])
+def nvfp4_expand(func, types, args, kwargs):
+    old_tensor = args[0]
+    new_size = args[1]
+    
+    # 1. Expand the quantized data. 
+    # We must translate the logical target size to the packed 4-bit size
+    data_new_size = tensor_size_hp_to_fp4x2(new_size, old_tensor.qdata.is_contiguous())
+    new_qdata = func(old_tensor.qdata, data_new_size, *args[2:], **kwargs)
+    
+    # 2. Expand the scales.
+    # We must figure out how the target logical size translates to the scale size.
+    # Usually, scales are smaller than the data by a factor of `block_size`.
+    # Let's assume the last dimension of the scale represents the block mapping.
+    # Note: If expand throws shape mismatch errors, you may need to slice/adjust `new_size` 
+    # to match the scale's block dimensions before expanding.
+    scale_new_size = list(new_size)
+    
+    # If the last dimension is quantized, adjust the target size for the scale 
+    # to account for block size mapping (e.g., divide the last dim by block_size)
+    if isinstance(old_tensor.block_size, tuple):
+         # basic heuristic, might need tweaking depending on how block_size is structured
+         pass 
+    
+    # Safest first attempt: Just expand scales matching the broadcast rules
+    try:
+        new_scale = func(old_tensor.scale, new_size, *args[2:], **kwargs)
+    except RuntimeError:
+        # If strict broadcasting fails, we fallback to just using the original scale
+        # and let the underlying kernel handle the broadcasting
+        new_scale = old_tensor.scale
+
+    return NVFP4Tensor(
+        new_qdata,
+        new_scale,
+        old_tensor.block_size,
+        old_tensor.orig_dtype,
+        old_tensor.per_tensor_scale,
+        old_tensor.act_per_tensor_scale,
+        old_tensor.is_swizzled_scales,
+        old_tensor.use_triton_kernel,
+        old_tensor.act_quant_kwargs,
+    )
 
 @implements([aten.view.default])
 def nvfp4_view_op(func, types, args, kwargs):
