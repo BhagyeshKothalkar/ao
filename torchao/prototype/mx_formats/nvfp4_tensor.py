@@ -445,33 +445,47 @@ def nvfp4_expand(func, types, args, kwargs):
     old_tensor = args[0]
     new_size = args[1]
     
-    # 1. Expand the quantized data. 
-    # We must translate the logical target size to the packed 4-bit size
-    data_new_size = tensor_size_hp_to_fp4x2(new_size, old_tensor.qdata.is_contiguous())
-    new_qdata = func(old_tensor.qdata, data_new_size, *args[2:], **kwargs)
-    
-    # 2. Expand the scales.
-    # We must figure out how the target logical size translates to the scale size.
-    # Usually, scales are smaller than the data by a factor of `block_size`.
-    # Let's assume the last dimension of the scale represents the block mapping.
-    # Note: If expand throws shape mismatch errors, you may need to slice/adjust `new_size` 
-    # to match the scale's block dimensions before expanding.
-    scale_new_size = list(new_size)
-    
-    # If the last dimension is quantized, adjust the target size for the scale 
-    # to account for block size mapping (e.g., divide the last dim by block_size)
-    if isinstance(old_tensor.block_size, tuple):
-         # basic heuristic, might need tweaking depending on how block_size is structured
-         pass 
-    
-    # Safest first attempt: Just expand scales matching the broadcast rules
-    try:
-        new_scale = func(old_tensor.scale, new_size, *args[2:], **kwargs)
-    except RuntimeError:
-        # If strict broadcasting fails, we fallback to just using the original scale
-        # and let the underlying kernel handle the broadcasting
-        new_scale = old_tensor.scale
+    def get_inner_expand_size(inner_tensor, logical_old_shape, logical_new_size):
+        """
+        Calculates the correct expanded shape for an inner packed tensor (qdata or scale)
+        by applying broadcasting rules only to un-packed dimensions.
+        """
+        # 1. Resolve any -1 in the target size
+        resolved_new_size = []
+        offset = len(logical_new_size) - len(logical_old_shape)
+        for i, s in enumerate(logical_new_size):
+            if s == -1:
+                resolved_new_size.append(logical_old_shape[i - offset])
+            else:
+                resolved_new_size.append(s)
+                
+        new_inner_shape = []
+        for i, s in enumerate(resolved_new_size):
+            if i < offset:
+                # Prepending new broadcast dimensions (e.g., adding a batch dim)
+                new_inner_shape.append(s)
+            else:
+                # Map to existing dimensions
+                orig_logical = logical_old_shape[i - offset]
+                inner_dim = inner_tensor.shape[i - offset]
+                
+                # If the logical dimension was 1, and the inner dimension is also 1, 
+                # it broadcasts natively. Otherwise, preserve the inner packed/padded dimension.
+                if orig_logical == 1 and inner_dim == 1:
+                    new_inner_shape.append(s)
+                else:
+                    new_inner_shape.append(inner_dim)
+                    
+        return new_inner_shape
 
+    # Calculate exact broadcast shapes independently for data and scales
+    new_qdata_size = get_inner_expand_size(old_tensor.qdata, old_tensor.shape, new_size)
+    new_scale_size = get_inner_expand_size(old_tensor.scale, old_tensor.shape, new_size)
+    
+    # Apply expand to the inner tensors
+    new_qdata = func(old_tensor.qdata, new_qdata_size, *args[2:], **kwargs)
+    new_scale = func(old_tensor.scale, new_scale_size, *args[2:], **kwargs)
+    
     return NVFP4Tensor(
         new_qdata,
         new_scale,
