@@ -175,6 +175,55 @@ def test_nvfp4_swizzled_scales_slicing(slice_dim, slice_spec):
     torch.testing.assert_close(sliced_reconstructed, expected, atol=1e-6, rtol=1e-6)
 
 
+@pytest.mark.parametrize("is_swizzled_scales", [False, True])
+@pytest.mark.parametrize(
+    "orig_shape, expand_size",
+    [
+        # Edge Case 1: Prepend a single new dimension (e.g., adding a batch dim)
+        pytest.param((32, 64), (2, 32, 64), id="prepend_single_dim"),
+        
+        # Edge Case 2: Prepend multiple dimensions
+        pytest.param((32, 64), (2, 2, 32, 64), id="prepend_multi_dim"),
+        
+        # Edge Case 3: Expand an existing size-1 dimension
+        pytest.param((1, 32, 64), (4, 32, 64), id="expand_size_1_dim"),
+        
+        # Edge Case 4: Use -1 to implicitly preserve original dimensions
+        pytest.param((1, 32, 64), (3, -1, -1), id="expand_with_minus_1"),
+    ],
+)
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_nvfp4_expand(is_swizzled_scales, orig_shape, expand_size):
+    """
+    Test that aten.expand works correctly on NVFP4Tensor, accurately mapping 
+    logical sizes to packed physical sizes, maintaining swizzled states, 
+    and preserving view semantics (no memory copying).
+    """
+    # 1. Initialize original high-precision data
+    x_hp = torch.randn(*orig_shape, device="cuda", dtype=torch.bfloat16)
+    
+    # 2. Quantize to NVFP4
+    x_nvfp4 = NVFP4Tensor.to_nvfp4(x_hp, is_swizzled_scales=is_swizzled_scales)
+    
+    # 3. Perform the expand operation on both
+    x_hp_expanded = x_hp.expand(*expand_size)
+    x_nvfp4_expanded = x_nvfp4.expand(*expand_size)
+    
+    # 4. Verify logical shapes and metadata
+    assert x_nvfp4_expanded.shape == x_hp_expanded.shape, "Logical shape mismatch after expand"
+    assert x_nvfp4_expanded.is_swizzled_scales == is_swizzled_scales, "Swizzled state lost during expand"
+    
+    # 5. Verify View Semantics (Expand should manipulate strides, NOT copy memory)
+    assert x_nvfp4_expanded.qdata.data_ptr() == x_nvfp4.qdata.data_ptr(), "Expand incorrectly allocated new memory for qdata"
+    assert x_nvfp4_expanded.scale.data_ptr() == x_nvfp4.scale.data_ptr(), "Expand incorrectly allocated new memory for scale"
+    
+    # 6. Verify dequantization structural equivalence
+    # Expanding the dequantized original should mathematically perfectly match dequantizing the expanded NVFP4
+    expected_reconstructed = x_nvfp4.dequantize(torch.bfloat16).expand(*expand_size)
+    actual_reconstructed = x_nvfp4_expanded.dequantize(torch.bfloat16)
+    
+    torch.testing.assert_close(actual_reconstructed, expected_reconstructed, atol=0.0, rtol=0.0)
+    
 @pytest.mark.parametrize(
     "slice_dim,slice_spec,expected_error",
     [
