@@ -448,7 +448,7 @@ def nvfp4_expand(func, types, args, kwargs):
     def get_inner_expand_size(inner_tensor, logical_old_shape, logical_new_size):
         """
         Calculates the correct expanded shape for an inner packed tensor (qdata or scale)
-        by applying broadcasting rules only to un-packed dimensions.
+        by safely handling swizzled layouts with extra trailing dimensions.
         """
         # 1. Resolve any -1 in the target size
         resolved_new_size = []
@@ -460,22 +460,30 @@ def nvfp4_expand(func, types, args, kwargs):
                 resolved_new_size.append(s)
                 
         new_inner_shape = []
-        for i, s in enumerate(resolved_new_size):
-            if i < offset:
-                # Prepending new broadcast dimensions (e.g., adding a batch dim)
-                new_inner_shape.append(s)
-            else:
-                # Map to existing dimensions
-                orig_logical = logical_old_shape[i - offset]
-                inner_dim = inner_tensor.shape[i - offset]
-                
-                # If the logical dimension was 1, and the inner dimension is also 1, 
-                # it broadcasts natively. Otherwise, preserve the inner packed/padded dimension.
+        
+        # 2. Prepend new broadcast dimensions (e.g., adding batch dims)
+        for i in range(offset):
+            new_inner_shape.append(resolved_new_size[i])
+            
+        # 3. Map to existing dimensions (up to the logical shape's length)
+        for i in range(len(logical_old_shape)):
+            orig_logical = logical_old_shape[i]
+            
+            # Safeguard: map only if the inner tensor physically has this dimension
+            if i < len(inner_tensor.shape):
+                inner_dim = inner_tensor.shape[i]
+                # If both logical and inner are 1, broadcast native
                 if orig_logical == 1 and inner_dim == 1:
-                    new_inner_shape.append(s)
+                    new_inner_shape.append(resolved_new_size[offset + i])
                 else:
                     new_inner_shape.append(inner_dim)
                     
+        # 4. CRITICAL FIX: Append any remaining packed/swizzled dimensions
+        # This prevents the 3rd/4th packed dimensions of swizzled tensors from being dropped.
+        if len(inner_tensor.shape) > len(logical_old_shape):
+            for i in range(len(logical_old_shape), len(inner_tensor.shape)):
+                new_inner_shape.append(inner_tensor.shape[i])
+                
         return new_inner_shape
 
     # Calculate exact broadcast shapes independently for data and scales
